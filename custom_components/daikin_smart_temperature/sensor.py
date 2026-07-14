@@ -18,14 +18,19 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     controller: SmartTemperatureController = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([
+    entities = [
         SmartTargetTempSensor(controller, entry),
         SmartLastModeSensor(controller, entry),
-    ])
+    ]
+    # Register options-change callbacks so Lovelace updates immediately
+    for entity in entities:
+        controller.register_options_callback(entity.schedule_update)
+    async_add_entities(entities)
 
 
 class _SmartTempBase(SensorEntity):
     _attr_has_entity_name = True
+    _attr_should_poll = False
 
     def __init__(self, controller: SmartTemperatureController, entry: ConfigEntry) -> None:
         self._controller = controller
@@ -39,9 +44,12 @@ class _SmartTempBase(SensorEntity):
             via_device=(DAIKIN_DOMAIN, device_id),
         )
 
+    def schedule_update(self) -> None:
+        """Called by controller when options change — pushes new state to HA."""
+        self.schedule_update_ha_state()
+
 
 class SmartTargetTempSensor(_SmartTempBase):
-    """Current effective target temperature (base + time-slot offset)."""
     _attr_name = "Smart Target Temperature"
     _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class  = SensorStateClass.MEASUREMENT
@@ -58,7 +66,6 @@ class SmartTargetTempSensor(_SmartTempBase):
 
 
 class SmartLastModeSensor(_SmartTempBase):
-    """Last mode commanded by the automation (cool/heat/fan/unknown)."""
     _attr_name = "Smart Last Mode"
     _attr_icon = "mdi:air-conditioner"
 

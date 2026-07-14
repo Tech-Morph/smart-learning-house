@@ -30,9 +30,8 @@ class DaikinSmartTempConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None) -> FlowResult:
         errors = {}
 
-        # Collect available Daikin devices from the sister integration
         daikin_data = self.hass.data.get(DAIKIN_DOMAIN, {})
-        devices: dict[str, str] = {}  # device_id -> friendly name
+        devices: dict[str, str] = {}
         for entry_id, coordinators in daikin_data.items():
             for coord in coordinators:
                 devices[coord.device_id] = coord.device_name
@@ -60,16 +59,19 @@ class DaikinSmartTempConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class DaikinSmartTempOptionsFlow(OptionsFlow):
-    """Options flow — all tuning params editable from the UI."""
+    """Options flow — all tuning params editable from the UI.
 
-    def __init__(self, entry: ConfigEntry) -> None:
-        self._entry = entry
+    Uses self.config_entry (live HA property) instead of a stale
+    entry snapshot stored in __init__, so defaults always reflect
+    the current saved values.
+    """
 
     async def async_step_init(self, user_input=None) -> FlowResult:
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        o = self._entry.options
+        # self.config_entry is the LIVE entry provided by HA's OptionsFlow base
+        o = self.config_entry.options
 
         schema = vol.Schema({
             vol.Optional(CONF_TARGET_TEMP,      default=o.get(CONF_TARGET_TEMP,      DEFAULT_TARGET_TEMP)):      vol.Coerce(float),

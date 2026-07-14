@@ -6,13 +6,10 @@ daikin_comfort_control coordinator (no extra API calls), and issues
 set_control_info commands when the temperature drifts outside the
 comfort band.
 
-Key behaviours:
-  - Reads current_temperature via coordinator.data.indoor_temp (htemp °C)
-  - Converts all logic to °F (matching HA display unit)
-  - Manual override detection: if someone changes the AC from the
-    Daikin app/remote, their change is respected for override_timeout seconds
-  - No-op if AC is already at desired state (avoids unnecessary cloud hits)
-  - Compressor short-cycle protection via min_mode_switch_interval
+Fix note: stores entry_id and always resolves the LIVE ConfigEntry from
+hass.config_entries on every access. This means options saved via the
+UI options flow take effect on the very next poll cycle — no HA restart
+or integration reload required.
 """
 from __future__ import annotations
 
@@ -42,12 +39,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Time-slot definitions: (start_hhmm, end_hhmm, options_key)
 _SLOTS = [
     (dtime(6,  0), dtime(9,  0), CONF_MORNING_OFFSET),
     (dtime(9,  0), dtime(17, 0), CONF_DAY_OFFSET),
     (dtime(17, 0), dtime(22, 0), CONF_EVENING_OFFSET),
-    (dtime(22, 0), dtime(6,  0), CONF_NIGHT_OFFSET),   # overnight
+    (dtime(22, 0), dtime(6,  0), CONF_NIGHT_OFFSET),
 ]
 
 
@@ -58,21 +54,28 @@ def _c_to_f(c: float) -> float:
 class SmartTemperatureController:
     """Autonomous temperature control brain."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator) -> None:
-        self.hass = hass
-        self.entry = entry
+    def __init__(self, hass: HomeAssistant, entry_id: str, coordinator) -> None:
+        self.hass        = hass
+        self._entry_id   = entry_id   # store ID, not the entry object
         self.coordinator = coordinator
         self._task: asyncio.Task | None = None
-        self._enabled: bool = True          # controlled by switch entity
+        self._enabled: bool = True
         self._last_mode_switch_at: float = 0.0
         self._last_commanded_mode: str | None = None
         self._last_commanded_fan: str | None = None
         self._last_commanded_stemp: float | None = None
-        self._override_until: float = 0.0   # monotonic time
+        self._override_until: float = 0.0
+        self._options_updated_callbacks: list = []
 
-        # Expose these for sensor entities
         self.current_target_f: float = DEFAULT_TARGET_TEMP
         self.last_mode: str = "unknown"
+
+    # ------------------------------------------------------------------ live entry
+
+    @property
+    def _entry(self) -> ConfigEntry:
+        """Always return the LIVE entry so options changes are seen immediately."""
+        return self.hass.config_entries.async_get_entry(self._entry_id)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -88,16 +91,34 @@ class SmartTemperatureController:
         self._enabled = enabled
         _LOGGER.info("Smart temperature automation %s", "enabled" if enabled else "disabled")
 
+    def register_options_callback(self, cb) -> None:
+        """Entities register here to be notified when options change."""
+        self._options_updated_callbacks.append(cb)
+
+    def options_updated(self) -> None:
+        """Called by __init__.py update listener when options are saved."""
+        self.current_target_f = self._target_temp_f()
+        _LOGGER.debug(
+            "Options reloaded — new target=%.1f°F, max=%.1f°F",
+            self.current_target_f,
+            self._opt(CONF_MAX_TEMP, DEFAULT_MAX_TEMP),
+        )
+        for cb in self._options_updated_callbacks:
+            cb()
+
     # ------------------------------------------------------------------ options helpers
 
     def _opt(self, key: str, default: Any) -> Any:
-        return self.entry.options.get(key, default)
+        """Read from the live entry's options, falling back to default."""
+        entry = self._entry
+        if entry is None:
+            return default
+        return entry.options.get(key, default)
 
     def _target_temp_f(self) -> float:
-        """Effective target temp in °F, including time-slot offset."""
-        base = self._opt(CONF_TARGET_TEMP, DEFAULT_TARGET_TEMP)
+        base   = self._opt(CONF_TARGET_TEMP, DEFAULT_TARGET_TEMP)
         offset = self._slot_offset()
-        raw = base + offset
+        raw    = base + offset
         return max(
             self._opt(CONF_MIN_TEMP, DEFAULT_MIN_TEMP),
             min(self._opt(CONF_MAX_TEMP, DEFAULT_MAX_TEMP), raw),
@@ -117,14 +138,14 @@ class SmartTemperatureController:
 
     def _determine_mode(self, htemp_f: float, target_f: float) -> str:
         delta = htemp_f - target_f
-        tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+        tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
         if abs(delta) <= tol:
             return MODE_FAN
         return MODE_COOL if delta > 0 else MODE_HEAT
 
     def _determine_fan(self, htemp_f: float, target_f: float) -> str:
         delta = abs(htemp_f - target_f)
-        tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
+        tol   = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
         if delta <= tol:
             return FAN_RATE_AUTO
         if delta <= self._opt(CONF_FAN_CLOSE_DELTA, DEFAULT_FAN_CLOSE_DELTA):
@@ -134,22 +155,15 @@ class SmartTemperatureController:
         return FAN_RATE_HIGH
 
     def _detect_manual_override(self, current_mode: str, current_fan: str, current_stemp_c: float) -> bool:
-        """
-        If the AC's actual state differs from what we last commanded,
-        someone used the app/remote. Activate override pause.
-        """
         if self._last_commanded_mode is None:
-            return False  # We haven't commanded anything yet
-
+            return False
         current_stemp_f = round(_c_to_f(current_stemp_c))
         last_stemp_f    = round(self._last_commanded_stemp) if self._last_commanded_stemp else None
-
-        mismatch = (
+        return (
             current_mode != self._last_commanded_mode
             or current_fan != self._last_commanded_fan
             or (last_stemp_f is not None and abs(current_stemp_f - last_stemp_f) >= 1)
         )
-        return mismatch
 
     # ------------------------------------------------------------------ main loop
 
@@ -162,7 +176,6 @@ class SmartTemperatureController:
             if not self._enabled:
                 continue
 
-            # Wait for coordinator to have data
             if self.coordinator.data is None:
                 _LOGGER.debug("Coordinator has no data yet, skipping")
                 continue
@@ -177,42 +190,35 @@ class SmartTemperatureController:
                 _LOGGER.warning("htemp is 0 — sensor not ready, skipping")
                 continue
 
-            htemp_f = _c_to_f(htemp_c)
-            target_f = self._target_temp_f()
-            self.current_target_f = target_f   # expose to sensor entity
+            htemp_f  = _c_to_f(htemp_c)
+            target_f = self._target_temp_f()   # reads live options every cycle
+            self.current_target_f = target_f
 
-            # Override detection
             override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
-            if override_timeout > 0:
-                if self._detect_manual_override(
-                    str(d.mode), d.fan_rate, d.target_temp
-                ):
-                    self._override_until = time.monotonic() + override_timeout
-                    _LOGGER.info(
-                        "Manual override detected — pausing automation for %ds",
-                        override_timeout,
-                    )
+            if override_timeout > 0 and self._detect_manual_override(
+                str(d.mode), d.fan_rate, d.target_temp
+            ):
+                self._override_until = time.monotonic() + override_timeout
+                _LOGGER.info("Manual override detected — pausing automation for %ds", override_timeout)
 
             if time.monotonic() < self._override_until:
-                remaining = self._override_until - time.monotonic()
-                _LOGGER.debug("Override active (%.0fs remaining)", remaining)
+                _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
                 continue
 
             mode = self._determine_mode(htemp_f, target_f)
             fan  = self._determine_fan(htemp_f, target_f)
 
-            # stemp: target in Celsius, 0.5C precision (Daikin requirement)
-            target_c = (target_f - 32) * 5 / 9
-            stemp_c  = round(target_c * 2) / 2
+            target_c  = (target_f - 32) * 5 / 9
+            stemp_c   = round(target_c * 2) / 2
+            stemp_str = str(stemp_c)
 
             _LOGGER.info(
                 "htemp=%.1f°F | target=%.1f°F | delta=%+.1f°F | mode=%s | fan=%s",
                 htemp_f, target_f, htemp_f - target_f, mode, fan,
             )
 
-            # No-op check: already at desired state
-            current_mode = str(d.mode)
-            current_fan  = d.fan_rate
+            current_mode    = str(d.mode)
+            current_fan     = d.fan_rate
             current_stemp_c = d.target_temp
             already_ok = (
                 current_mode == mode
@@ -224,7 +230,6 @@ class SmartTemperatureController:
                 self.last_mode = mode
                 continue
 
-            # Compressor short-cycle protection
             mode_changed = mode != self._last_commanded_mode
             now = time.monotonic()
             if mode_changed and (now - self._last_mode_switch_at) < self._opt(
@@ -236,16 +241,14 @@ class SmartTemperatureController:
                 )
                 continue
 
-            # Build full params (mirrors climate.py _full_params to satisfy Daikin API)
-            stemp_str = str(stemp_c)
             params: dict[str, Any] = {
                 "pow":      "1",
                 "mode":     mode,
                 "stemp":    stemp_str,
-                "dt3":      stemp_str,     # required mirror for mode=3 (cool)
+                "dt3":      stemp_str,
                 "f_rate":   fan,
                 "shum":     "0",
-                "f_dir_ud": d.f_dir_ud,   # preserve existing swing
+                "f_dir_ud": d.f_dir_ud,
                 "f_dir_lr": d.f_dir_lr,
                 "dh3":      "0",
             }
@@ -254,12 +257,10 @@ class SmartTemperatureController:
                 await self.coordinator.api.set_device_parameters(
                     self.coordinator.device_id, params
                 )
-                # Update coordinator optimistic state
                 self.coordinator.set_optimistic_mode(int(mode))
                 self.coordinator.set_optimistic_fan_rate(fan)
                 self.coordinator.set_optimistic_target_temp(stemp_c)
 
-                # Track what we commanded for override detection
                 self._last_commanded_mode  = mode
                 self._last_commanded_fan   = fan
                 self._last_commanded_stemp = target_f

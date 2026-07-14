@@ -25,14 +25,12 @@ PLATFORMS = [Platform.SWITCH, Platform.SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up from a config entry."""
-    # Resolve the daikin_comfort_control coordinator for the selected device
     daikin_data = hass.data.get(DAIKIN_DOMAIN, {})
     if not daikin_data:
         raise ConfigEntryNotReady(
             "daikin_comfort_control is not loaded. Install and configure it first."
         )
 
-    # Find the coordinator matching the device_id chosen during config flow
     device_id = entry.data["device_id"]
     coordinator = None
     for entry_id, coordinators in daikin_data.items():
@@ -47,13 +45,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Ensure the base integration is set up."
         )
 
-    controller = SmartTemperatureController(hass, entry, coordinator)
+    # Pass entry_id, NOT the entry object itself — controller always resolves
+    # the live entry from hass.config_entries so options changes are seen
+    # immediately without a restart.
+    controller = SmartTemperatureController(hass, entry.entry_id, coordinator)
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = controller
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     controller.start()
+
+    # Re-notify entities when options are saved so Lovelace updates instantly
+    entry.async_on_unload(
+        entry.add_update_listener(_async_options_updated)
+    )
+
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Called by HA when the user saves new options. Refreshes entity states."""
+    _LOGGER.debug("Options updated for %s — notifying entities", entry.entry_id)
+    controller: SmartTemperatureController = hass.data[DOMAIN].get(entry.entry_id)
+    if controller:
+        controller.options_updated()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

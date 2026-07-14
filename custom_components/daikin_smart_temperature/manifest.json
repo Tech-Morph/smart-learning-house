@@ -1,0 +1,12 @@
+{
+  "domain": "daikin_smart_temperature",
+  "name": "Daikin Comfort Control Smart Temperature",
+  "version": "1.0.0",
+  "documentation": "https://github.com/Tech-Morph/smart-learning-house",
+  "issue_tracker": "https://github.com/Tech-Morph/smart-learning-house/issues",
+  "dependencies": ["daikin_comfort_control"],
+  "codeowners": ["@Tech-Morph"],
+  "iot_class": "cloud_polling",
+  "config_flow": true,
+  "requirements": []
+}

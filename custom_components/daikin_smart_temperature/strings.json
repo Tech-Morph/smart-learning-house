@@ -1,0 +1,40 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Daikin Comfort Control Smart Temperature",
+        "description": "Select the Daikin device to control. The base integration must already be configured.",
+        "data": {
+          "device_id": "Daikin Device"
+        }
+      }
+    },
+    "abort": {
+      "no_daikin_devices": "No Daikin devices found. Install and configure daikin_comfort_control first.",
+      "already_configured": "This device already has smart temperature control configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Smart Temperature Settings",
+        "data": {
+          "target_temp":       "Target temperature (\u00b0F)",
+          "tolerance":         "Tolerance band (\u00b0F) — no action within this range",
+          "min_temp":          "Minimum temperature (\u00b0F)",
+          "max_temp":          "Maximum temperature (\u00b0F)",
+          "learning_enabled":  "Enable time-of-day offsets",
+          "morning_offset":    "Morning offset 6am\u20139am (\u00b0F)",
+          "day_offset":        "Day offset 9am\u20175pm (\u00b0F)",
+          "evening_offset":    "Evening offset 5pm\u201310pm (\u00b0F)",
+          "night_offset":      "Night offset 10pm\u20136am (\u00b0F)",
+          "fan_close_delta":   "Low fan threshold (\u00b0F from target)",
+          "fan_mid_delta":     "Medium fan threshold (\u00b0F from target)",
+          "poll_interval":     "Poll interval (seconds, min 30)",
+          "mode_switch_min":   "Min time between mode switches (seconds, min 60)",
+          "override_timeout":  "Manual override pause duration (seconds, 0=disabled)"
+        }
+      }
+    }
+  }
+}

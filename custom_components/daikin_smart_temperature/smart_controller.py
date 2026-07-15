@@ -15,14 +15,21 @@ Key design decisions:
   - Respects allow_cool / allow_heat / allow_fan_only toggles.
   - Caps fan speed at max_fan_mode.
   - Summer heat gate checks BOTH indoor temp and outdoor temp (from the
-    Daikin unit's own otemp reading — no extra sensor needed) and
-    optionally restricts heating to nighttime only.
+    Daikin unit's own otemp reading) and optionally restricts heating
+    to nighttime only.
   - Pre-cooling: tracks outdoor temp over a rolling window; if it's
-    rising quickly, tightens the tolerance band so the unit doesn't
-    coast in fan-only while outdoor heat is climbing.
+    rising quickly, tightens the tolerance band.
   - Rolling in-memory learning log: records each cycle's outdoor/indoor/
-    target/mode for future empirical tuning. No behavior changes from
-    the log itself yet — it's pure data collection.
+    target/mode for future empirical tuning.
+  - Manual-override detection IGNORES setpoint comparisons while the
+    last commanded mode was fan-only, since Daikin units frequently
+    report a stale/meaningless stemp value in that mode — this was
+    causing false-positive overrides that silently re-armed forever
+    and blocked _determine_mode() from ever running again.
+  - Safety bypass: even if an override pause IS active, a delta from
+    target that reaches safety_override_delta forces the pause to
+    clear immediately so the unit can correct. This is the hard
+    backstop against any future overnight runaway, regardless of cause.
 """
 from __future__ import annotations
 
@@ -48,6 +55,7 @@ from .const import (
     CONF_OUTDOOR_HEAT_MAX, CONF_PRECOOL_ENABLED,
     CONF_PRECOOL_RISE_THRESHOLD, CONF_PRECOOL_TOLERANCE_CUT,
     CONF_LEARNING_LOG_ENABLED, CONF_LEARNING_LOG_SIZE,
+    CONF_SAFETY_OVERRIDE_DELTA,
     DEFAULT_TARGET_TEMP, DEFAULT_TOLERANCE, DEFAULT_MIN_TEMP, DEFAULT_MAX_TEMP,
     DEFAULT_POLL_INTERVAL, DEFAULT_MODE_SWITCH_MIN, DEFAULT_OVERRIDE_TIMEOUT,
     DEFAULT_LEARNING_ENABLED,
@@ -59,6 +67,7 @@ from .const import (
     DEFAULT_OUTDOOR_HEAT_MAX, DEFAULT_PRECOOL_ENABLED,
     DEFAULT_PRECOOL_RISE_THRESHOLD, DEFAULT_PRECOOL_TOLERANCE_CUT,
     DEFAULT_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_SIZE,
+    DEFAULT_SAFETY_OVERRIDE_DELTA,
     OUTDOOR_TREND_WINDOW_SECONDS,
     FAN_RATE_AUTO, FAN_RATE_LOW, FAN_RATE_MEDIUM, FAN_RATE_HIGH,
     FAN_CAP_AUTO, FAN_CAP_LOW, FAN_CAP_MEDIUM, FAN_CAP_HIGH,
@@ -96,7 +105,9 @@ class SmartTemperatureController:
         self._override_until: float = 0.0
         self._options_updated_callbacks: list = []
 
-        self.current_target_f: float = DEFAULT_TARGET_TEMP
+        # Initialize from real saved options immediately so sensors don't
+        # show a placeholder "72°F / unknown" before the first cycle runs.
+        self.current_target_f: float = self._target_temp_f()
         self.last_mode: str = "unknown"
 
         # Outdoor trend tracking: (timestamp, outdoor_temp_f)
@@ -223,9 +234,7 @@ class SmartTemperatureController:
         In summer season mode, heating only kicks in once BOTH:
           - the house has dropped to/below summer_heat_min_temp, AND
           - it's actually cold outside (<= outdoor_heat_max)
-        and optionally only during the night slot. This prevents the
-        heater firing just because the AC overcooled the house on a
-        mild evening.
+        and optionally only during the night slot.
         """
         if not self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT):
             return False
@@ -299,8 +308,25 @@ class SmartTemperatureController:
         return self._cap_fan_rate(desired)
 
     def _detect_manual_override(self, current_mode: str, current_fan: str, current_stemp_c: float) -> bool:
+        """Detect if the user changed the AC manually (app/remote).
+
+        IMPORTANT: while the last commanded mode was fan-only, the
+        setpoint (stemp) reported by the unit is frequently stale or
+        firmware-defaulted and meaningless. Comparing it in that state
+        was causing false-positive overrides on nearly every poll,
+        which continuously re-armed the override pause and blocked
+        _determine_mode() from ever running — this was the root cause
+        of the overnight fan-mode-stuck-at-74°F issue.
+        """
         if self._last_commanded_mode is None:
             return False
+
+        if self._last_commanded_mode == MODE_FAN:
+            return (
+                current_mode != self._last_commanded_mode
+                or current_fan != self._last_commanded_fan
+            )
+
         current_stemp_f = round(_c_to_f(current_stemp_c))
         last_stemp_f    = round(self._last_commanded_stemp) if self._last_commanded_stemp else None
         return (
@@ -406,9 +432,22 @@ class SmartTemperatureController:
             self._override_until = time.monotonic() + override_timeout
             _LOGGER.info("Manual override detected — pausing for %ds", override_timeout)
 
+        delta_now = abs(htemp_f - target_f)
+        safety_delta = self._opt(CONF_SAFETY_OVERRIDE_DELTA, DEFAULT_SAFETY_OVERRIDE_DELTA)
+
         if time.monotonic() < self._override_until:
-            _LOGGER.debug("Override active (%.0fs remaining)", self._override_until - time.monotonic())
-            return
+            if delta_now >= safety_delta:
+                _LOGGER.warning(
+                    "Safety bypass triggered — delta=%.1f°F >= %.1f°F, clearing override pause to force correction",
+                    delta_now, safety_delta,
+                )
+                self._override_until = 0.0
+            else:
+                _LOGGER.debug(
+                    "Override active (%.0fs remaining, delta=%.1f°F below safety threshold %.1f°F)",
+                    self._override_until - time.monotonic(), delta_now, safety_delta,
+                )
+                return
 
         mode = self._determine_mode(htemp_f, target_f, outdoor_f)
         fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
@@ -442,11 +481,17 @@ class SmartTemperatureController:
         if mode_changed and (now - self._last_mode_switch_at) < self._opt(
             CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
         ):
-            _LOGGER.debug(
-                "Mode switch to %s suppressed — %.0fs since last switch",
-                mode, now - self._last_mode_switch_at,
-            )
-            return
+            if delta_now >= safety_delta:
+                _LOGGER.warning(
+                    "Mode-switch guard bypassed — delta=%.1f°F >= safety threshold %.1f°F",
+                    delta_now, safety_delta,
+                )
+            else:
+                _LOGGER.debug(
+                    "Mode switch to %s suppressed — %.0fs since last switch",
+                    mode, now - self._last_mode_switch_at,
+                )
+                return
 
         params: dict[str, Any] = {
             "pow":      "1",

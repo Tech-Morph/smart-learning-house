@@ -28,11 +28,18 @@ Key design decisions:
     target that reaches safety_override_delta forces the pause to
     clear immediately. Also bypasses the mode-switch short-cycle guard
     under the same condition.
+  - De-escalation exception: mode is now computed BEFORE the override
+    check. If the freshly-computed mode is fan-only (i.e. the room is
+    back within tolerance), the override pause is ALWAYS bypassed for
+    that single decision, unconditionally, with no threshold needed.
+    Backing off to fan-only is never harmful even if a human touched
+    the unit recently — only escalating INTO cool/heat is gated by the
+    override pause. Without this, a mild overshoot inside an active
+    override window could sit uncorrected indefinitely (cool running
+    below target) until the integration was manually reloaded.
   - Entity push notifications: sensors use should_poll=False, so every
-    cycle that updates current_target_f / last_mode MUST explicitly
-    call _notify_entities() or the frontend freezes on stale/Unknown
-    values until the options flow is opened (which was the only code
-    path previously calling the callback list).
+    cycle that updates current_target_f / last_mode explicitly calls
+    _notify_entities() or the frontend freezes on stale values.
 """
 from __future__ import annotations
 
@@ -108,33 +115,21 @@ class SmartTemperatureController:
         self._override_until: float = 0.0
         self._options_updated_callbacks: list = []
 
-        # Initialize from real saved options immediately so sensors don't
-        # show a placeholder "72°F / unknown" before the first cycle runs.
         self.current_target_f: float = self._target_temp_f()
         self.last_mode: str = "unknown"
 
-        # Outdoor trend tracking: (timestamp, outdoor_temp_f)
         self._outdoor_history: deque[tuple[float, float]] = deque()
-
-        # Rolling in-memory learning log (FIFO)
         self._cycle_log: deque[dict] = deque()
 
     # ------------------------------------------------------------------ live entry
 
     @property
     def _entry(self) -> ConfigEntry | None:
-        """Always return the LIVE entry so options changes are seen immediately."""
         return self.hass.config_entries.async_get_entry(self._entry_id)
 
     # ------------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        """Start the background loop using async_create_background_task.
-
-        Background tasks are NOT tracked by HA's setup/bootstrap watchdog,
-        so this will never cause a 'Setup timed out' error regardless of
-        how long the loop sleeps.
-        """
         self._task = self.hass.async_create_background_task(
             self._loop(), name="daikin_smart_temp_loop"
         )
@@ -149,24 +144,13 @@ class SmartTemperatureController:
         _LOGGER.info("Smart temperature automation %s", "enabled" if enabled else "disabled")
 
     def register_options_callback(self, cb) -> None:
-        """Sensors/switch entities register here (should_poll=False) so
-        they can be told to refresh whenever state actually changes."""
         self._options_updated_callbacks.append(cb)
 
     def _notify_entities(self) -> None:
-        """Push updated state to all registered entities.
-
-        Called both after options are saved AND after every control
-        cycle that changes current_target_f / last_mode. Without this
-        being called from _run_cycle(), sensors freeze on their initial
-        (often Unknown/placeholder) value after every restart until the
-        options flow happens to be opened.
-        """
         for cb in self._options_updated_callbacks:
             cb()
 
     def options_updated(self) -> None:
-        """Called by __init__.py update listener when options are saved."""
         self.current_target_f = self._target_temp_f()
         _LOGGER.debug(
             "Options reloaded — new target=%.1f°F, max=%.1f°F",
@@ -209,7 +193,6 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ outdoor trend / pre-cooling
 
     def _record_outdoor_sample(self, outdoor_temp_f: float) -> None:
-        """Track outdoor temp over a rolling window for pre-cool detection."""
         now = time.monotonic()
         self._outdoor_history.append((now, outdoor_temp_f))
         cutoff = now - OUTDOOR_TREND_WINDOW_SECONDS
@@ -217,8 +200,6 @@ class SmartTemperatureController:
             self._outdoor_history.popleft()
 
     def _outdoor_rising_fast(self) -> bool:
-        """True if outdoor temp has risen more than precool_rise_threshold
-        within the tracking window."""
         if len(self._outdoor_history) < 2:
             return False
         oldest_temp = self._outdoor_history[0][1]
@@ -228,7 +209,6 @@ class SmartTemperatureController:
         return rise >= threshold
 
     def _effective_tolerance(self) -> float:
-        """Base tolerance, tightened when outdoor heat is climbing fast."""
         tol = self._opt(CONF_TOLERANCE, DEFAULT_TOLERANCE)
         if not self._opt(CONF_PRECOOL_ENABLED, DEFAULT_PRECOOL_ENABLED):
             return tol
@@ -245,13 +225,6 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ mode / fan logic
 
     def _heat_allowed_now(self, htemp_f: float, outdoor_temp_f: float) -> bool:
-        """Decide whether heating is permitted right now.
-
-        In summer season mode, heating only kicks in once BOTH:
-          - the house has dropped to/below summer_heat_min_temp, AND
-          - it's actually cold outside (<= outdoor_heat_max)
-        and optionally only during the night slot.
-        """
         if not self._opt(CONF_ALLOW_HEAT, DEFAULT_ALLOW_HEAT):
             return False
 
@@ -277,7 +250,6 @@ class SmartTemperatureController:
         return True
 
     def _cap_fan_rate(self, desired_rate: str) -> str:
-        """Clamp the desired fan rate to the user's max_fan_mode setting."""
         cap = self._opt(CONF_MAX_FAN_MODE, DEFAULT_MAX_FAN_MODE)
 
         if cap == FAN_CAP_AUTO:
@@ -302,7 +274,6 @@ class SmartTemperatureController:
         if delta > tol:
             return MODE_COOL if allow_cool else MODE_FAN
 
-        # delta < -tol -> house is colder than target
         if self._heat_allowed_now(htemp_f, outdoor_temp_f):
             return MODE_HEAT
 
@@ -324,15 +295,6 @@ class SmartTemperatureController:
         return self._cap_fan_rate(desired)
 
     def _detect_manual_override(self, current_mode: str, current_fan: str, current_stemp_c: float) -> bool:
-        """Detect if the user changed the AC manually (app/remote).
-
-        IMPORTANT: while the last commanded mode was fan-only, the
-        setpoint (stemp) reported by the unit is frequently stale or
-        firmware-defaulted and meaningless. Comparing it in that state
-        caused false-positive overrides on nearly every poll, which
-        continuously re-armed the override pause and blocked
-        _determine_mode() from ever running.
-        """
         if self._last_commanded_mode is None:
             return False
 
@@ -353,8 +315,6 @@ class SmartTemperatureController:
     # ------------------------------------------------------------------ learning log
 
     def _record_cycle(self, outdoor_f: float, htemp_f: float, target_f: float, mode: str) -> None:
-        """Append a snapshot to the rolling learning log. Pure data
-        collection for now — no decisions are made from this yet."""
         if not self._opt(CONF_LEARNING_LOG_ENABLED, DEFAULT_LEARNING_LOG_ENABLED):
             return
 
@@ -374,14 +334,11 @@ class SmartTemperatureController:
 
     @property
     def learning_log_size(self) -> int:
-        """Exposed for a future diagnostic sensor."""
         return len(self._cycle_log)
 
     # ------------------------------------------------------------------ main loop
 
     async def _loop(self) -> None:
-        """Main control loop. Sleep is at the END so the first cycle runs
-        immediately on startup and never blocks the bootstrap phase."""
         _LOGGER.info("SmartTemperatureController started for %s", self.coordinator.device_id)
 
         await asyncio.sleep(0)
@@ -422,7 +379,7 @@ class SmartTemperatureController:
         outdoor_c = getattr(d, "outdoor_temp", None)
         outdoor_f = _c_to_f(outdoor_c) if outdoor_c not in (None, 0.0) else htemp_f
         if outdoor_c in (None, 0.0):
-            _LOGGER.debug("otemp unavailable this cycle — using htemp as fallback for outdoor-aware logic")
+            _LOGGER.debug("otemp unavailable this cycle — using htemp as fallback")
 
         self._record_outdoor_sample(outdoor_f)
 
@@ -440,6 +397,13 @@ class SmartTemperatureController:
             self._outdoor_rising_fast(),
         )
 
+        # Compute the prospective mode BEFORE checking the override pause.
+        # This is required so we know whether this cycle wants to
+        # de-escalate to fan-only (always allowed) or escalate into
+        # cool/heat (gated by the override pause).
+        mode = self._determine_mode(htemp_f, target_f, outdoor_f)
+        fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
+
         override_timeout = self._opt(CONF_OVERRIDE_TIMEOUT, DEFAULT_OVERRIDE_TIMEOUT)
         if override_timeout > 0 and self._detect_manual_override(
             str(d.mode), d.fan_rate, d.target_temp
@@ -450,7 +414,10 @@ class SmartTemperatureController:
         delta_now = abs(htemp_f - target_f)
         safety_delta = self._opt(CONF_SAFETY_OVERRIDE_DELTA, DEFAULT_SAFETY_OVERRIDE_DELTA)
 
-        if time.monotonic() < self._override_until:
+        override_active = time.monotonic() < self._override_until
+        is_deescalation  = mode == MODE_FAN
+
+        if override_active and not is_deescalation:
             if delta_now >= safety_delta:
                 _LOGGER.warning(
                     "Safety bypass triggered — delta=%.1f°F >= %.1f°F, clearing override pause to force correction",
@@ -459,14 +426,15 @@ class SmartTemperatureController:
                 self._override_until = 0.0
             else:
                 _LOGGER.debug(
-                    "Override active (%.0fs remaining, delta=%.1f°F below safety threshold %.1f°F)",
-                    self._override_until - time.monotonic(), delta_now, safety_delta,
+                    "Override active (%.0fs remaining, delta=%.1f°F) — blocking escalation to %s",
+                    self._override_until - time.monotonic(), delta_now, mode,
                 )
                 self._notify_entities()
                 return
-
-        mode = self._determine_mode(htemp_f, target_f, outdoor_f)
-        fan  = self._determine_fan(htemp_f, target_f, outdoor_f)
+        elif override_active and is_deescalation:
+            _LOGGER.debug(
+                "Override active but de-escalating to fan-only — always allowed regardless of pause"
+            )
 
         self._record_cycle(outdoor_f, htemp_f, target_f, mode)
 
@@ -495,7 +463,7 @@ class SmartTemperatureController:
 
         mode_changed = mode != self._last_commanded_mode
         now = time.monotonic()
-        if mode_changed and (now - self._last_mode_switch_at) < self._opt(
+        if mode_changed and not is_deescalation and (now - self._last_mode_switch_at) < self._opt(
             CONF_MODE_SWITCH_MIN, DEFAULT_MODE_SWITCH_MIN
         ):
             if delta_now >= safety_delta:

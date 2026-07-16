@@ -37,6 +37,7 @@ from .const import (
     CONF_PRECOOL_TOLERANCE_CUT,
     CONF_LEARNING_LOG_ENABLED,
     CONF_LEARNING_LOG_SIZE,
+    CONF_SAFETY_OVERRIDE_DELTA,
     DEFAULT_TARGET_TEMP,
     DEFAULT_TOLERANCE,
     DEFAULT_MIN_TEMP,
@@ -64,6 +65,7 @@ from .const import (
     DEFAULT_PRECOOL_TOLERANCE_CUT,
     DEFAULT_LEARNING_LOG_ENABLED,
     DEFAULT_LEARNING_LOG_SIZE,
+    DEFAULT_SAFETY_OVERRIDE_DELTA,
     FAN_CAP_AUTO,
     FAN_CAP_LOW,
     FAN_CAP_MEDIUM,
@@ -169,6 +171,11 @@ class DaikinSmartTempOptionsFlow(OptionsFlow):
             vol.Optional(
                 CONF_PRECOOL_TOLERANCE_CUT,
                 default=o.get(CONF_PRECOOL_TOLERANCE_CUT, DEFAULT_PRECOOL_TOLERANCE_CUT),
+            ): vol.Coerce(float),
+
+            vol.Optional(
+                CONF_SAFETY_OVERRIDE_DELTA,
+                default=o.get(CONF_SAFETY_OVERRIDE_DELTA, DEFAULT_SAFETY_OVERRIDE_DELTA),
             ): vol.Coerce(float),
 
             vol.Optional(

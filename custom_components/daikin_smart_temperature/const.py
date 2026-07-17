@@ -36,8 +36,18 @@ CONF_PRECOOL_TOLERANCE_CUT = "precool_tolerance_cut"
 CONF_LEARNING_LOG_ENABLED = "learning_log_enabled"
 CONF_LEARNING_LOG_SIZE = "learning_log_size"
 
-# Safety bypass — forces correction even if a manual-override pause is active
 CONF_SAFETY_OVERRIDE_DELTA = "safety_override_delta"
+
+# Layer 1 — hard fan-only ceiling
+CONF_FAN_CEILING_ENABLED = "fan_ceiling_enabled"
+CONF_FAN_CEILING_TEMP = "fan_ceiling_temp"
+
+# Layer 2 — forecast-aware pre-cooling
+CONF_WEATHER_ENTITY = "weather_entity"
+CONF_FORECAST_PRECOOL_ENABLED = "forecast_precool_enabled"
+CONF_FORECAST_HIGH_THRESHOLD = "forecast_high_threshold"
+CONF_FORECAST_PRECOOL_TOLERANCE_CUT = "forecast_precool_tolerance_cut"
+CONF_FORECAST_CHECK_INTERVAL_CYCLES = "forecast_check_interval_cycles"
 
 FAN_RATE_AUTO = "A"
 FAN_RATE_LOW = "2"
@@ -56,9 +66,9 @@ FAN_CAP_HIGH = "high"
 SEASON_NORMAL = "normal"
 SEASON_SUMMER = "summer"
 
-DEFAULT_TARGET_TEMP = 70.0
+DEFAULT_TARGET_TEMP = 72.0
 DEFAULT_TOLERANCE = 2.0
-DEFAULT_MIN_TEMP = 64.0
+DEFAULT_MIN_TEMP = 65.0
 DEFAULT_MAX_TEMP = 85.0
 DEFAULT_POLL_INTERVAL = 60
 DEFAULT_MODE_SWITCH_MIN = 300
@@ -88,9 +98,16 @@ DEFAULT_PRECOOL_TOLERANCE_CUT = 0.5
 DEFAULT_LEARNING_LOG_ENABLED = True
 DEFAULT_LEARNING_LOG_SIZE = 500
 
-# If actual delta from target reaches/exceeds this, force correction even
-# during an active manual-override pause. Prevents overnight runaway drift.
 DEFAULT_SAFETY_OVERRIDE_DELTA = 4.0
 
-# Outdoor trend tracking window, in seconds
+# Layer 1 defaults
+DEFAULT_FAN_CEILING_ENABLED = True
+DEFAULT_FAN_CEILING_TEMP = 70.0
+
+# Layer 2 defaults
+DEFAULT_FORECAST_PRECOOL_ENABLED = False
+DEFAULT_FORECAST_HIGH_THRESHOLD = 90.0
+DEFAULT_FORECAST_PRECOOL_TOLERANCE_CUT = 0.5
+DEFAULT_FORECAST_CHECK_INTERVAL_CYCLES = 15
+
 OUTDOOR_TREND_WINDOW_SECONDS = 1800
